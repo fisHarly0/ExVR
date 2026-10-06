@@ -110,7 +110,9 @@ class HandPositionReferenceTests(unittest.TestCase):
     def test_reference_loss_expiry_and_recovery(self):
         self.assertIsNone(self.hand._hand_position_reference())
         self.detect_face()
-        np.testing.assert_allclose(self.hand._hand_position_reference(), [0.1, 0.1])
+        anchor, depth = self.hand._hand_position_reference()
+        np.testing.assert_allclose(anchor, [0.1, 0.1])
+        self.assertEqual(depth, -0.1)
         self.now_ms += 501
         self.assertIsNone(self.hand._hand_position_reference())
         self.detect_face()
@@ -132,21 +134,69 @@ class HandPositionReferenceTests(unittest.TestCase):
             self.detect_face()
         self.assertIsNone(self.hand._hand_position_reference())
 
-    def test_invalid_smoothed_depth_does_not_run_regression_model(self):
+    def test_invalid_reference_depth_does_not_run_regression_model(self):
         for depth in (0.0, -0.004, 0.1, float("nan"), float("inf"), -float("inf")):
             with self.subTest(depth=depth):
-                self.g.data["HeadImagePosition"][2]["v"] = depth
-                self.assertIsNone(self.hand.get_fitted_hand_distance(np.zeros((21, 3))))
+                self.assertIsNone(self.hand.get_fitted_hand_distance(np.zeros((21, 3)), depth))
         self.g.hand_regression_model.predict.assert_not_called()
 
     def test_valid_depth_mapping_is_preserved(self):
-        self.g.data["HeadImagePosition"][2]["v"] = -0.1
         cfg = self.g.config["Tracking"]["Hand"]
         expected = self.hand._soft_limit_depth(np.interp(
             (0.05 / -0.1 + cfg["z_shifting"]) * cfg["z_scalar"], [-2, 2], [-1.2, 1]))
-        self.assertAlmostEqual(self.hand.get_fitted_hand_distance(np.zeros((21, 3))), expected)
+        self.assertAlmostEqual(self.hand.get_fitted_hand_distance(np.zeros((21, 3)), -0.1), expected)
         self.g.hand_regression_model.predict.return_value = np.asarray([float("nan")])
-        self.assertIsNone(self.hand.get_fitted_hand_distance(np.zeros((21, 3))))
+        self.assertIsNone(self.hand.get_fitted_hand_distance(np.zeros((21, 3)), -0.1))
+
+    def hand_positions(self, smoothing):
+        if smoothing:
+            return self.g.latest_data[70:73] + self.g.latest_data[76:79]
+        return [value["v"] for side in ("Left", "Right")
+                for value in self.g.data[side + "HandPosition"]]
+
+    def test_recovered_reference_does_not_depend_on_older_smoothed_depth(self):
+        for smoothing in (False, True):
+            with self.subTest(smoothing=smoothing):
+                self.g.config["Smoothing"]["enable"] = smoothing
+                self.detect_face()
+                self.g.data["HeadImagePosition"][2]["v"] = -0.1
+                self.detect_hands()
+                expected = self.hand_positions(smoothing)
+                for stale_depth in (0.0, -0.3, float("nan")):
+                    with self.subTest(stale_depth=stale_depth):
+                        self.detect_face(present=False)
+                        self.g.config["Tracking"]["Hand"]["hand_return_time"] = 0
+                        self.detect_hands()
+                        self.detect_face()
+                        self.g.data["HeadImagePosition"][2]["v"] = stale_depth
+                        self.detect_hands()
+                        self.assertTrue(self.g.controller.left_hand.enable)
+                        self.assertTrue(self.g.controller.right_hand.enable)
+                        np.testing.assert_allclose(self.hand_positions(smoothing), expected)
+
+    def test_new_face_frame_during_hand_processing_cannot_mix_snapshots(self):
+        for smoothing in (False, True):
+            with self.subTest(smoothing=smoothing):
+                self.g.config["Smoothing"]["enable"] = smoothing
+                self.detect_face()
+                self.g.data["HeadImagePosition"][2]["v"] = -0.1
+                self.detect_hands()
+                expected = self.hand_positions(smoothing)
+
+                def publish_newer_reference(_features):
+                    # Simulate another worker publishing while the first hand's
+                    # depth model runs, before processing the second hand.
+                    self.g.hand_position_reference = (0.3, 0.2, -0.4, self.now_ms)
+                    self.g.data["HeadImagePosition"][2]["v"] = -0.4
+                    return np.asarray([0.05])
+
+                with patch.object(self.g.hand_regression_model, "predict",
+                                  side_effect=publish_newer_reference):
+                    self.detect_hands()
+                np.testing.assert_allclose(self.hand_positions(smoothing), expected)
+                # A later hand frame should then consume the newly published reference.
+                self.detect_hands()
+                self.assertFalse(np.allclose(self.hand_positions(smoothing), expected))
 
     def test_invalid_face_depth_does_not_poison_smoothing_or_direct_state(self):
         for smoothing in (False, True):
@@ -196,9 +246,6 @@ class HandPositionReferenceTests(unittest.TestCase):
                 self.assertFalse(self.g.controller.left_hand.enable)
                 self.assertFalse(self.g.controller.right_hand.enable)
                 self.detect_face()
-                # Stand in for the independent smoothing worker's depth update.
-                if smoothing:
-                    self.g.data["HeadImagePosition"][2]["v"] = self.g.latest_data[116]
                 self.detect_hands()
                 self.assertTrue(self.g.controller.left_hand.enable)
                 self.assertTrue(self.g.controller.right_hand.enable)
